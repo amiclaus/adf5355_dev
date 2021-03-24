@@ -172,22 +172,24 @@
 /*************************** Types Declarations *******************************/
 /******************************************************************************/
 
-enum {
-	ADF5355_FREQ,
-	ADF5355_FREQ_REFIN,
-	ADF5355_PWRDOWN,
-};
-
-enum supported_device {
+/**
+ * @enum adf5355_supported_device
+ * @brief Devices supported by the drivers.
+ */
+enum adf5355_device_id {
 	ADF5355,
 	ADF4355,
 	ADF4355_2,
 	ADF4355_3,
 };
 
+/**
+ * @struct adf5355_dev
+ * @brief  Device descriptor.
+ */
 struct adf5355_dev {
 	spi_desc	*spi_desc;
-	enum supported_device   dev_id;
+	enum adf5355_device_id   dev_id;
 	uint32_t    regs[ADF5355_REG_NUM];
 	uint64_t    freq_req;
 	uint8_t     freq_req_chan;
@@ -222,9 +224,13 @@ struct adf5355_dev {
 	uint32_t    delay_us;
 };
 
+/**
+ * @struct ad5355_init_param
+ * @brief  Structure containing the initialization parameters.
+ */
 struct adf5355_init_param {
 	spi_init_param	*spi_init;
-	enum supported_device   dev_id;
+	enum adf5355_device_id   dev_id;
 	uint64_t    freq_req;
 	uint8_t     freq_req_chan;
 	uint32_t	clkin_freq;
@@ -253,11 +259,7 @@ struct adf5355_init_param {
 /* SPI register write to device. */
 static int32_t adf5355_write(struct adf5355_dev *dev,
 			     uint8_t reg_addr,
-			     uint32_t data)
-
-/* Initialize the device. */
-int32_t adf5355_init(struct adf5355_dev **device,
-		     const struct adf5355_init_param *init_param);
+			     uint32_t data);
 
 /* Recalculate rate corresponding to a channel. */
 int32_t adf5355_clk_recalc_rate(struct adf5355_dev *dev, uint32_t chan,

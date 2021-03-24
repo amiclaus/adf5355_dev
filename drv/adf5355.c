@@ -43,6 +43,8 @@
 #include <inttypes.h>
 #include <stdio.h>
 #include "error.h"
+#include <malloc.h>
+#include "delay.h"
 #include "util.h"
 #include "adf5355.h"
 
@@ -62,14 +64,143 @@ static int32_t adf5355_write(struct adf5355_dev *dev,
 			     uint32_t data)
 {
 	uint8_t buf[ADF5355_SPI_NO_BYTES];
-	val = val | reg_addr;
+	data = data | reg_addr;
 
-	buf[0] = val >> 24;
-	buf[1] = val >> 16;
-	buf[2] = val >> 8;
-	buf[3] = val;
+	buf[0] = data >> 24;
+	buf[1] = data >> 16;
+	buf[2] = data >> 8;
+	buf[3] = data;
 
 	return spi_write_and_read(dev->spi_desc, buf, ARRAY_SIZE(buf));
+}
+
+/**
+ * Compute PLL parameters.
+ * @param vco - The VCO frequency.
+ * @param pfd - The PFD frequency.
+ * @param integer - The integer division factor.
+ * @param fract1 - The fractionality.
+ * @param fract2 - The auxiliary fractionality.
+ * @param mod2 - The auxiliary modulus.
+ * @return None.
+ */
+static void adf5355_pll_fract_n_compute(uint64_t vco,
+					uint64_t pfd,
+					uint32_t *integer,
+					uint32_t *fract1,
+					uint32_t *fract2,
+					uint32_t *mod2)
+{
+	uint64_t tmp;
+	uint32_t gcd_div;
+
+	tmp = do_div(&vco, pfd);
+	tmp = tmp * ADF5355_MODULUS1;
+	*fract2 = do_div(&tmp, pfd);
+
+	*integer = vco;
+	*fract1 = tmp;
+
+	*mod2 = pfd;
+
+	while (*mod2 > ADF5355_MAX_MODULUS2) {
+		*mod2 >>= 1;
+		*fract2 >>= 1;
+	}
+
+	gcd_div = greatest_common_divisor(*fract2, *mod2);
+	*mod2 /= gcd_div;
+	*fract2 /= gcd_div;
+}
+
+/**
+ * ADF5355 Register configuration
+ * @param dev - The device structure.
+ * @return SUCCESS in case of success, negative error code otherwise.
+ */
+static int32_t adf5355_reg_config(struct adf5355_dev *dev)
+{
+	int32_t ret, i;
+
+	for (i = ADF5355_REG(12); i >= ADF5355_REG(1); i--) {
+		ret = adf5355_write(dev, ADF5355_REG(i), dev->regs[i]);
+		if (ret != SUCCESS)
+			return ret;
+	}
+
+	udelay(dev->delay_us);
+
+	return adf5355_write(dev, ADF5355_REG(0), dev->regs[0]);
+}
+
+/**
+ * Set the output frequency for one channel.
+ * @param dev - The device structure.
+ * @param freq - The output frequency.
+ * @param chan - The selected channel.
+ * @return SUCCESS in case of success, negative error code otherwise.
+ */
+static int32_t adf5355_set_freq(struct adf5355_dev *dev,
+				uint64_t freq,
+				uint8_t chan)
+{
+	uint32_t cp_bleed;
+	bool prescaler;
+
+	if (chan > dev->num_channels)
+		return FAILURE;
+
+	if (chan == 0) {
+		if ((freq > dev->max_out_freq) || (freq < dev->min_out_freq))
+			return -EINVAL;
+
+		dev->rf_div_sel = 0;
+
+		while (freq < dev->min_vco_freq) {
+			freq <<= 1;
+			dev->rf_div_sel++;
+		}
+	} else {
+		/* ADF5355 RFoutB 6800...13600 MHz */
+		if ((freq > ADF5355_MAX_OUTB_FREQ) || (freq < ADF5355_MIN_OUTB_FREQ))
+			return -EINVAL;
+
+		freq >>= 1;
+	}
+
+	adf5355_pll_fract_n_compute(freq, dev->fpfd, &dev->integer, &dev->fract1,
+				    &dev->fract2, &dev->mod2);
+
+	prescaler = (dev->integer >= ADF5355_MIN_INT_PRESCALER_89);
+
+	cp_bleed = DIV_ROUND_UP(400 * dev->cp_ua, dev->integer * 375);
+	cp_bleed = clamp(cp_bleed, 1U, 255U);
+
+	dev->regs[ADF5355_REG(0)] = ADF5355_REG0_INT(dev->integer) |
+				    ADF5355_REG0_PRESCALER(prescaler) |
+				    ADF5355_REG0_AUTOCAL(1);
+
+	dev->regs[ADF5355_REG(1)] = ADF5355_REG1_FRACT(dev->fract1);
+
+	dev->regs[ADF5355_REG(2)] = ADF5355_REG2_MOD2(dev->mod2) |
+				    ADF5355_REG2_FRAC2(dev->fract2);
+
+	dev->regs[ADF5355_REG(6)] = ADF5355_REG6_OUTPUT_PWR(dev->outa_power) |
+				    ADF5355_REG6_RF_OUT_EN(dev->outa_en) |
+				    (dev->dev_id == ADF5355 ? ADF5355_REG6_RF_OUTB_EN(!dev->outb_en) :
+				     ADF4355_REG6_OUTPUTB_PWR(dev->outb_power) |
+				     ADF4355_REG6_RF_OUTB_EN(dev->outb_en)) |
+				    ADF5355_REG6_MUTE_TILL_LOCK_EN(dev->mute_till_lock_en) |
+				    ADF5355_REG6_CP_BLEED_CURR(cp_bleed) |
+				    ADF5355_REG6_RF_DIV_SEL(dev->rf_div_sel) |
+				    ADF5355_REG6_FEEDBACK_FUND(1) |
+				    ADF5355_REG6_NEG_BLEED_EN(dev->cp_neg_bleed_en) |
+				    ADF5355_REG6_GATED_BLEED_EN(dev->cp_gated_bleed_en) |
+				    ADF5355_REG6_DEFAULT;
+
+	dev->freq_req = freq;
+
+	return adf5355_reg_config(dev);
 }
 
 /**
@@ -82,14 +213,13 @@ static uint64_t adf5355_pll_fract_n_get_rate(struct adf5355_dev *dev,
 		uint32_t channel)
 {
 	uint64_t val, tmp;
-	uint32_t ref_div_sel;
 
 	val = (((uint64_t)dev->integer * ADF5355_MODULUS1) + dev->fract1) * dev->fpfd;
 	tmp = (uint64_t)dev->fract2 * dev->fpfd;
 	do_div(&tmp, dev->mod2);
 	val += tmp + ADF5355_MODULUS1 / 2;
 
-	do_div(val, ADF5355_MODULUS1 *
+	do_div(&val, ADF5355_MODULUS1 *
 	       (1 << (channel == 1 ? 0 : dev->rf_div_sel)));
 
 	if (channel == 1)
@@ -133,43 +263,78 @@ int32_t adf5355_clk_set_rate(struct adf5355_dev *dev, uint32_t chan,
 }
 
 /**
- * Compute PLL parameters.
- * @param vco - The VCO frequency.
- * @param pfd - The PFD frequency.
- * @param integer - The integer division factor.
- * @param fract1 - The fractionality.
- * @param fract2 - The auxiliary fractionality.
- * @param mod2 - The auxiliary modulus.
- * @return None.
+ * Setup the device.
+ * @param dev - The device structure.
+ * @return SUCCESS in case of success, negative error code otherwise.
  */
-static void adf5355_pll_fract_n_compute(uint64_t vco,
-					uint64_t pfd,
-					uint32_t *integer,
-					uint32_t *fract1,
-					uint32_t *fract2,
-					uint32_t *mod2)
+static int32_t adf5355_setup(struct adf5355_dev *dev)
 {
-	uint64_t tmp;
-	uint32_t gcd_div;
+	uint32_t tmp;
 
-	tmp = do_div(&vco, pfd);
-	tmp = tmp * ADF5355_MODULUS1;
-	*fract2 = do_div(&tmp, pfd);
+	dev->ref_div_factor = 0;
 
-	*integer = vco;
-	*fract1 = tmp;
+	/* Calculate and maximize PFD frequency */
+	do {
+		dev->ref_div_factor++;
+		dev->fpfd = (dev->clkin_freq * (dev->ref_doubler_en ? 2 : 1)) /
+			    (dev->ref_div_factor * (dev->ref_div2_en ? 2 : 1));
+	} while (dev->fpfd > ADF5355_MAX_FREQ_PFD);
 
-	*mod2 = pfd;
+	tmp = DIV_ROUND_CLOSEST(dev->cp_ua - 315, 315U);
+	tmp = clamp(tmp, 0U, 15U);
 
-	while (*mod2 > ADF5355_MAX_MODULUS2) {
-		*mod2 >>= 1;
-		*fract2 >>= 1;
-	}
+	dev->regs[ADF5355_REG(4)] = ADF5355_REG4_COUNTER_RESET_EN(0) |
+				    ADF5355_REG4_CP_THREESTATE_EN(0) |
+				    ADF5355_REG4_POWER_DOWN_EN(0) |
+				    ADF5355_REG4_PD_POLARITY_POS(!dev->phase_detector_polarity_neg) |
+				    ADF5355_REG4_MUX_LOGIC(dev->mux_out_3v3_en) |
+				    ADF5355_REG4_REFIN_MODE_DIFF(dev->ref_diff_en) |
+				    ADF5355_REG4_CHARGE_PUMP_CURR(tmp) |
+				    ADF5355_REG4_DOUBLE_BUFF_EN(1) |
+				    ADF5355_REG4_10BIT_R_CNT(dev->ref_div_factor) |
+				    ADF5355_REG4_RDIV2_EN(dev->ref_div2_en) |
+				    ADF5355_REG4_RMULT2_EN(dev->ref_doubler_en) |
+				    ADF5355_REG4_MUXOUT(dev->mux_out_sel);
 
-	gcd_div = greatest_common_divisor(*fract2, *mod2);
-	*mod2 /= gcd_div;
-	*fract2 /= gcd_div;
+	dev->regs[ADF5355_REG(5)] = ADF5355_REG5_DEFAULT;
+
+	dev->regs[ADF5355_REG(7)] = ADF5355_REG7_LD_MODE_INT_N_EN(0) |
+				    ADF5355_REG7_FACT_N_LD_PRECISION(3) |
+				    ADF5355_REG7_LOL_MODE_EN(0) |
+				    ADF5355_REG7_LD_CYCLE_CNT(0) |
+				    ADF5355_REG7_LE_SYNCED_REFIN_EN(1) |
+				    ADF5355_REG7_DEFAULT;
+
+	dev->regs[ADF5355_REG(8)] = ADF5355_REG8_DEFAULT;
+
+	/* Calculate Timeouts */
+	tmp = DIV_ROUND_UP(dev->fpfd, 20000U * 30U);
+	tmp = clamp(tmp, 1U, 1023U);
+
+	dev->regs[ADF5355_REG(9)] = ADF5355_REG9_TIMEOUT(tmp) |
+				    ADF5355_REG9_SYNTH_LOCK_TIMEOUT(DIV_ROUND_UP(dev->fpfd * 2U, 100000U * tmp)) |
+				    ADF5355_REG9_ALC_TIMEOUT(DIV_ROUND_UP(dev->fpfd * 5U, 100000U * tmp)) |
+				    ADF5355_REG9_VCO_BAND_DIV(DIV_ROUND_UP(dev->fpfd, 2400000U));
+
+	tmp = DIV_ROUND_UP(dev->fpfd / 100000U - 2, 4);
+	tmp = clamp(tmp, 1U, 255U);
+
+	/* Delay > 16 ADC_CLK cycles */
+	dev->delay_us = DIV_ROUND_UP(16000000UL, dev->fpfd / (4 * tmp + 2));
+
+	dev->regs[ADF5355_REG(10)] = ADF5355_REG10_ADC_EN(1) |
+				     ADF5355_REG10_ADC_CONV_EN(1) |
+				     ADF5355_REG10_ADC_CLK_DIV(tmp) |
+				     ADF5355_REG10_DEFAULT;
+
+	dev->regs[ADF5355_REG(11)] = ADF5355_REG11_DEFAULT;
+
+	dev->regs[ADF5355_REG(12)] = ADF5355_REG12_PHASE_RESYNC_CLK_DIV(1) |
+				     ADF5355_REG12_DEFAULT;
+
+	return adf5355_set_freq(dev, dev->freq_req, dev->freq_req_chan);
 }
+
 
 /**
  * @brief Initializes the ADF5355.
@@ -181,10 +346,9 @@ int32_t adf5355_init(struct adf5355_dev **device,
 		     const struct adf5355_init_param *init_param)
 {
 	int32_t ret;
-	uint32_t i;
 	struct adf5355_dev *dev;
 
-	dev = (struct adf5902_dev *)calloc(1, sizeof(*dev));
+	dev = (struct adf5355_dev *)calloc(1, sizeof(*dev));
 	if (!dev)
 		return -ENOMEM;
 
@@ -249,188 +413,6 @@ error_dev:
 	free(dev);
 
 	return ret;
-}
-
-/**
- * Set the output frequency for one channel.
- * @param dev - The device structure.
- * @param freq - The output frequency.
- * @param channel - The selected channel.
- * @return SUCCESS in case of success, negative error code otherwise.
- */
-static int32_t adf5355_set_freq(struct adf5355_dev *dev,
-				uint64_t freq,
-				uint8_t channel)
-{
-	uint32_t cp_bleed;
-	int32_t ret;
-	bool prescaler;
-
-	if (chan > dev->num_channels)
-		return FAILURE;
-
-	if (channel == 0) {
-		if ((freq > dev->max_out_freq) || (freq < dev->min_out_freq))
-			return -EINVAL;
-
-		dev->rf_div_sel = 0;
-
-		while (freq < dev->min_vco_freq) {
-			freq <<= 1;
-			dev->rf_div_sel++;
-		}
-	} else {
-		/* ADF5355 RFoutB 6800...13600 MHz */
-		if ((freq > ADF5355_MAX_OUTB_FREQ) || (freq < ADF5355_MIN_OUTB_FREQ))
-			return -EINVAL;
-
-		freq >>= 1;
-	}
-
-	adf5355_pll_fract_n_compute(freq, dev->fpfd, &dev->integer, &dev->fract1,
-				    &dev->fract2, &dev->mod2);
-
-	prescaler = (dev->integer >= ADF5355_MIN_INT_PRESCALER_89);
-
-	cp_bleed = DIV_ROUND_UP(400 * dev->cp_ua, dev->integer * 375);
-	cp_bleed = clamp(cp_bleed, 1U, 255U);
-
-	dev->regs[ADF5355_REG(0)] = ADF5355_REG0_INT(dev->integer) |
-				    ADF5355_REG0_PRESCALER(prescaler) |
-				    ADF5355_REG0_AUTOCAL(1);
-	if (ret != SUCCESS)
-		return ret;
-
-	dev->regs[ADF5355_REG(1)] = ADF5355_REG1_FRACT(dev->fract1);
-	if (ret != SUCCESS)
-		return ret;
-
-	dev->regs[ADF5355_REG(2)] = ADF5355_REG2_MOD2(dev->mod2) |
-				    ADF5355_REG2_FRAC2(dev->fract2);
-	if (ret != SUCCESS)
-		return ret;
-
-	dev->regs[ADF5355_REG(6)] = ADF5355_REG6_OUTPUT_PWR(dev->outa_power) |
-				    ADF5355_REG6_RF_OUT_EN(dev->outa_en) |
-				    (dev->dev_id == ADF5355 ? ADF5355_REG6_RF_OUTB_EN(!dev->outb_en) :
-				     ADF4355_REG6_OUTPUTB_PWR(dev->outb_power) |
-				     ADF4355_REG6_RF_OUTB_EN(dev->outb_en)) |
-				    ADF5355_REG6_MUTE_TILL_LOCK_EN(dev->mute_till_lock_en) |
-				    ADF5355_REG6_CP_BLEED_CURR(cp_bleed) |
-				    ADF5355_REG6_RF_DIV_SEL(dev->rf_div_sel) |
-				    ADF5355_REG6_FEEDBACK_FUND(1) |
-				    ADF5355_REG6_NEG_BLEED_EN(dev->cp_neg_bleed_en) |
-				    ADF5355_REG6_GATED_BLEED_EN(dev->cp_gated_bleed_en) |
-				    ADF5355_REG6_DEFAULT;
-	if (ret != SUCCESS)
-		return ret;
-
-	dev->freq_req = freq;
-
-	return adf5355_reg_config(dev);
-}
-
-/**
- * Setup the device.
- * @param dev - The device structure.
- * @return SUCCESS in case of success, negative error code otherwise.
- */
-static int32_t adf5355_setup(struct adf5355_dev *dev)
-{
-	uint32_t tmp;
-	int32_t ret;
-
-	dev->ref_div_factor = 0;
-
-	/* Calculate and maximize PFD frequency */
-	do {
-		ref_div_factor++;
-		dev->fpfd = (dev->clkin * (dev->ref_doubler_en ? 2 : 1)) /
-			    (ref_div_factor * (dev->ref_div2_en ? 2 : 1));
-	} while (dev->fpfd > ADF5355_MAX_FREQ_PFD);
-
-	tmp = DIV_ROUND_CLOSEST(dev->cp_curr_uA - 315, 315U);
-	tmp = clamp(tmp, 0U, 15U);
-
-	dev->regs[ADF5355_REG(4)] = ADF5355_REG4_COUNTER_RESET_EN(0) |
-				    ADF5355_REG4_CP_THREESTATE_EN(0) |
-				    ADF5355_REG4_POWER_DOWN_EN(0) |
-				    ADF5355_REG4_PD_POLARITY_POS(!dev->phase_detector_polarity_neg) |
-				    ADF5355_REG4_MUX_LOGIC(dev->mux_out_3v3_en) |
-				    ADF5355_REG4_REFIN_MODE_DIFF(dev->ref_diff_en) |
-				    ADF5355_REG4_CHARGE_PUMP_CURR(tmp) |
-				    ADF5355_REG4_DOUBLE_BUFF_EN(1) |
-				    ADF5355_REG4_10BIT_R_CNT(dev->ref_div_factor) |
-				    ADF5355_REG4_RDIV2_EN(dev->ref_div2_en) |
-				    ADF5355_REG4_RMULT2_EN(dev->ref_doubler_en) |
-				    ADF5355_REG4_MUXOUT(dev->mux_out_sel);
-	if (ret != SUCCESS)
-		return ret;
-
-	dev->regs[ADF5355_REG(5)] = ADF5355_REG5_DEFAULT);
-	if (ret != SUCCESS)
-	return ret;
-
-	dev->regs[ADF5355_REG(7)] = ADF5355_REG7_LD_MODE_INT_N_EN(0) |
-					    ADF5355_REG7_FACT_N_LD_PRECISION(3) |
-					    ADF5355_REG7_LOL_MODE_EN(0) |
-					    ADF5355_REG7_LD_CYCLE_CNT(0) |
-					    ADF5355_REG7_LE_SYNCED_REFIN_EN(1) |
-					    ADF5355_REG7_DEFAULT);
-		if (ret != SUCCESS)
-		return ret;
-
-		dev->regs[ADF5355_REG(8)] = ADF5355_REG8_DEFAULT;
-		if (ret != SUCCESS)
-			return ret;
-
-			/* Calculate Timeouts */
-			tmp = DIV_ROUND_UP(dev->fpfd, 20000U * 30U);
-			tmp = clamp(tmp, 1U, 1023U);
-			RF_DIV_SEL
-			tmp = DIV_ROUND_UP(dev->fpfd / 100000U - 2, 4);
-			tmp = clamp(tmp, 1U, 255U);
-
-			/* Delay > 16 ADC_CLK cycles */
-			dev->delay_us = DIV_ROUND_UP(16000000UL, dev->fpfd / (4 * tmp + 2))
-
-					dev->regs[ADF5355_REG(10)] = ADF5355_REG10_ADC_EN(1) |
-							ADF5355_REG10_ADC_CONV_EN(1) |
-							ADF5355_REG10_ADC_CLK_DIV(tmp) |
-							ADF5355_REG10_DEFAULT;
-			if (ret != SUCCESS)
-				return ret;
-
-				dev->regs[ADF5355_REG(11)] = ADF5355_REG11_DEFAULT;
-				if (ret != SUCCESS)
-					return ret;
-
-					dev->regs[ADF5355_REG(12)] = ADF5355_REG12_PHASE_RESYNC_CLK_DIV(1) |
-								     ADF5355_REG12_DEFAULT;
-					if (ret != SUCCESS)
-						return ret;
-
-						return adf5355_set_freq(dev, dev->freq_req, dev->freq_req_chan);
-					}
-
-/**
- * ADF5355 Register configuration
- * @param device - The device structure.
- * @return SUCCESS in case of success, negative error code otherwise.
- */
-static int32_t adf5355_reg_config(struct adf5355_dev *de)
-{
-	int32_t ret, i;
-
-	for (i = ADF5355_REG(12); i >= ADF5355_REG(1); i--) {
-		ret = adf5355_write(dev, ADF5355_REG(i), dev->regs[i]);
-		if (ret != SUCCESS)
-			return ret;
-	}
-
-	udelay(dev->delay_us);
-
-	return adf5355_write(dev, ADF5355_REG(0), dev->regs[0]);
 }
 
 /**
