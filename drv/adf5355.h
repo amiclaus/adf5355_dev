@@ -256,11 +256,6 @@ struct adf5355_init_param {
 /************************ Functions Declarations ******************************/
 /******************************************************************************/
 
-/* SPI register write to device. */
-static int32_t adf5355_write(struct adf5355_dev *dev,
-			     uint8_t reg_addr,
-			     uint32_t data);
-
 /* Recalculate rate corresponding to a channel. */
 int32_t adf5355_clk_recalc_rate(struct adf5355_dev *dev, uint32_t chan,
 				uint64_t *rate);
